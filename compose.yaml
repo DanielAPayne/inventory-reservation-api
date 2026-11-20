@@ -1,0 +1,49 @@
+# Credentials for the bundled local database. PostgreSQL has no published host port.
+x-client-environment: &client-environment
+  DATABASE_URL: postgresql://inventory:local-demo-only@db:5432/inventory
+
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: inventory
+      POSTGRES_USER: inventory
+      POSTGRES_PASSWORD: local-demo-only
+    volumes:
+      - stock:/var/lib/postgresql/data
+      - ./db/001_inventory.sql:/docker-entrypoint-initdb.d/001_inventory.sql:ro
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "inventory", "-d", "inventory"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  api:
+    build:
+      context: .
+      target: api
+    environment: *client-environment
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8000/ready', timeout=2).close()"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  verifier:
+    profiles: [verify]
+    build:
+      context: .
+      target: verifier
+    environment:
+      <<: *client-environment
+      API_BASE_URL: http://api:8000
+    ulimits:
+      nofile:
+        soft: 4096
+        hard: 4096
+
+volumes:
+  stock:

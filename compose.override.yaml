@@ -1,0 +1,5 @@
+# Used by docker compose up for interactive local development.
+services:
+  api:
+    ports:
+      - "127.0.0.1:${INVENTORY_PORT:-8000}:8000"
