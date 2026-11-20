@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd -- "$(dirname -- "$0")"
+
+# A unique project owns its database and network. Only the development override publishes a port.
+project="inventory-check-$(date +%s)-$$"
+compose=(docker compose -f compose.yaml -p "$project" --profile verify)
+
+cleanup() {
+  local status=$?
+  if (( status != 0 )); then
+    "${compose[@]}" logs --no-color --tail 60 api db >&2 || true
+  fi
+  "${compose[@]}" down --volumes --remove-orphans >&2
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+"${compose[@]}" build api verifier >&2
+"${compose[@]}" up --detach --wait --wait-timeout 120 api >&2
+"${compose[@]}" run --rm --no-deps -T verifier

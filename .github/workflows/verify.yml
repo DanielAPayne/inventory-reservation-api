@@ -1,0 +1,23 @@
+name: Verify reservations
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  postgres:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Exercise the HTTP API against PostgreSQL
+        shell: bash
+        run: |
+          ./verify | tee "$RUNNER_TEMP/reservation-results.txt"
+          {
+            echo '### Verified reservation behavior'
+            cat "$RUNNER_TEMP/reservation-results.txt"
+          } >> "$GITHUB_STEP_SUMMARY"
