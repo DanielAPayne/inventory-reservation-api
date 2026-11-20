@@ -12,6 +12,7 @@ CMD ["python", "-m", "uvicorn", "inventory.api:app", "--host", "0.0.0.0", "--por
 FROM base AS verifier
 COPY tests/requirements.txt /tmp/test-requirements.txt
 RUN pip install --no-cache-dir -r /tmp/test-requirements.txt
+COPY inventory ./inventory
 COPY tests ./tests
 USER 10001:10001
 CMD ["python", "-m", "unittest", "discover", "-s", "tests", "-v"]

@@ -5,11 +5,15 @@ import os
 import time
 import unittest
 from collections import Counter
+from datetime import timedelta
 from typing import NamedTuple
 from uuid import uuid4
 
 import aiohttp
 import asyncpg
+from fastapi import HTTPException
+
+from inventory.api import allocate
 
 
 class Reply(NamedTuple):
@@ -88,7 +92,7 @@ class ReservationTests(unittest.IsolatedAsyncioTestCase):
         units = sum(row["quantity"] for row in rows)
         self.assertEqual((len(rows), units), (capacity, capacity))
         self.assertEqual(await self.inventory(), {
-            "sku": self.sku, "capacity": capacity, "reserved": capacity, "available": 0
+            "sku": self.sku, "capacity": capacity, "reserved": capacity, "confirmed": 0, "available": 0
         })
         version = await self.db.fetchval("SHOW server_version")
         print(f"- Burst: {len(replies):,} HTTP requests, {counts[201]} created, "
@@ -186,3 +190,130 @@ class ReservationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result.status, 422, result.body)
         refused = await self.hold("empty")
         self.assertEqual((refused.status, refused.body["detail"]), (409, "insufficient_stock"))
+
+    async def pause_between_check_and_insert(self, lock):
+        """Pause buyer A after its stock check, let buyer B run, then let A finish.
+
+        This calls the API's own allocation function on two direct connections. With lock=False
+        it is the same code minus FOR UPDATE, which is the race the lock exists to prevent.
+        """
+        await self.define(1)
+        a = await asyncpg.connect(os.environ["DATABASE_URL"])
+        b = await asyncpg.connect(os.environ["DATABASE_URL"])
+        self.addAsyncCleanup(a.close)
+        self.addAsyncCleanup(b.close)
+        paused, resume = asyncio.Event(), asyncio.Event()
+
+        async def hook():
+            paused.set()
+            await resume.wait()
+
+        async def buyer(conn, key, after_check=None):
+            try:
+                async with conn.transaction(isolation="read_committed"):
+                    await allocate(conn, self.sku, key, 1, timedelta(seconds=60),
+                                   lock=lock, after_check=after_check)
+                return "created"
+            except HTTPException as refused:
+                return refused.detail
+
+        first = asyncio.create_task(buyer(a, "first", hook))
+        await asyncio.wait_for(paused.wait(), 5)
+        second = asyncio.create_task(buyer(b, "second"))
+        done, _ = await asyncio.wait({second}, timeout=1)
+        resume.set()
+        outcome = (second in done, await first, await second)
+        units = await self.db.fetchval("SELECT sum(quantity) FROM reservations WHERE sku = $1", self.sku)
+        return outcome, units
+
+    async def test_lock_control_shows_the_oversell_it_prevents(self):
+        unlocked, oversold = await self.pause_between_check_and_insert(lock=False)
+        # Control: without the lock, B finishes while A is paused, and both get the one unit.
+        self.assertEqual(unlocked, (True, "created", "created"))
+        self.assertEqual(oversold, 2)
+
+        self.sku = f"locked-{uuid4().hex}"
+        locked, held = await self.pause_between_check_and_insert(lock=True)
+        # With the lock, B waits for A to commit, then sees no stock left.
+        self.assertEqual(locked, (False, "created", "insufficient_stock"))
+        self.assertEqual(held, 1)
+        print("- Lock control: with FOR UPDATE removed, buyer B got through while buyer A was paused "
+              "between its stock check and insert, selling 2 of 1 unit. With the lock, B waited for A "
+              "and was refused.", flush=True)
+
+    async def post(self, path):
+        return await self.request("POST", path)
+
+    async def test_confirm_and_cancel(self):
+        await self.define(3)
+        sold = await self.hold("sold", ttl=1)
+        confirmed = await self.post(sold.location + "/confirm")
+        self.assertEqual((confirmed.status, confirmed.body["status"]), (200, "confirmed"))
+        self.assertEqual(await self.post(sold.location + "/confirm"), confirmed)
+        refused = await self.post(sold.location + "/cancel")
+        self.assertEqual((refused.status, refused.body["detail"]), (409, "reservation_confirmed"))
+
+        released = await self.hold("released")
+        cancelled = await self.post(released.location + "/cancel")
+        self.assertEqual((cancelled.status, cancelled.body["status"]), (200, "cancelled"))
+        self.assertEqual(await self.post(released.location + "/cancel"), cancelled)
+        late = await self.post(released.location + "/confirm")
+        self.assertEqual((late.status, late.body["detail"]), (409, "reservation_cancelled"))
+        self.assertEqual((await self.hold("released")).body, released.body)
+
+        lapsed = await self.hold("lapsed", ttl=1)
+        self.assertEqual(await self.inventory(), {
+            "sku": self.sku, "capacity": 3, "reserved": 2, "confirmed": 1, "available": 1
+        })
+        deadline = time.monotonic() + 15
+        while (await self.request("GET", lapsed.location)).body["status"] == "active":
+            self.assertLess(time.monotonic(), deadline)
+            await asyncio.sleep(0.1)
+        expired = await self.post(lapsed.location + "/confirm")
+        self.assertEqual((expired.status, expired.body["detail"]), (409, "reservation_expired"))
+        self.assertEqual((await self.post(lapsed.location + "/cancel")).body["status"], "expired")
+        # The confirmed one-second hold is past its expires_at too, and still counts as sold.
+        self.assertEqual((await self.request("GET", sold.location)).body["status"], "confirmed")
+        self.assertEqual(await self.inventory(), {
+            "sku": self.sku, "capacity": 3, "reserved": 1, "confirmed": 1, "available": 2
+        })
+        self.assertEqual((await self.post(f"/reservations/{uuid4()}/confirm")).status, 404)
+
+    async def test_confirm_racing_expiry_never_double_sells(self):
+        """Confirm a one-second hold while five new buyers compete, timed across its expiry."""
+        skus, n, buyers = [], 40, 5
+
+        async def race(i):
+            sku = f"race-{i}-{uuid4().hex}"
+            skus.append(sku)
+            self.assertEqual((await self.request("PUT", f"/items/{sku}", json={"capacity": 1})).status, 201)
+            hold = await self.request("POST", f"/items/{sku}/reservations",
+                                      headers={"Idempotency-Key": "hold"}, json={"ttl_seconds": 1})
+            # Spread the attempts from 200 ms before to 200 ms after the expiry instant.
+            await asyncio.sleep(1 + (i / (n - 1) - 0.5) * 0.4)
+            confirm, *rivals = await asyncio.gather(
+                self.post(hold.location + "/confirm"),
+                *(self.request("POST", f"/items/{sku}/reservations",
+                               headers={"Idempotency-Key": f"rival-{k}"}, json={}) for k in range(buyers))
+            )
+            won = Counter(r.status for r in rivals)[201]
+            if confirm.status == 200:
+                self.assertEqual(won, 0)
+                return "confirmed"
+            self.assertEqual((confirm.status, confirm.body["detail"]), (409, "reservation_expired"))
+            # Usually one rival takes the freed unit. If every rival checked before the expiry
+            # instant, the unit is left free, which is also correct.
+            self.assertLessEqual(won, 1)
+            return "expired"
+
+        outcomes = Counter(await asyncio.gather(*(race(i) for i in range(n))))
+        in_use = await self.db.fetch(
+            """SELECT r.sku, sum(r.quantity) AS units FROM reservations AS r
+               WHERE r.sku = ANY($1) AND r.cancelled_at IS NULL
+                 AND (r.confirmed_at IS NOT NULL OR r.expires_at > statement_timestamp())
+               GROUP BY r.sku""", skus
+        )
+        self.assertEqual(max(row["units"] for row in in_use), 1)
+        print(f"- Confirm vs expiry: {n} holds confirmed within 200 ms of expiring while {buyers} buyers "
+              f"competed: {outcomes['confirmed']} confirmed in time, {outcomes['expired']} expired first. "
+              f"No SKU ended with more than 1 of 1 unit in use.", flush=True)
